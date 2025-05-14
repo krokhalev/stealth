@@ -29,16 +29,22 @@ func main() {
 	// 1. Создаем cgroup
 	err := createCgroup()
 	if err != nil {
-		log.Fatalf("Failed to create cgroup: %v", err)
+		log.Fatalf("[-] Failed to create cgroup: %v", err)
 	}
 	fmt.Printf("[+] Created cgroup: %s\n", cgroupPath)
 
 	// 2. Получаем cgroup inode
 	cgroupID, err := getCgroupInode()
 	if err != nil {
-		log.Fatalf("Failed to get cgroup ID: %v", err)
+		log.Fatalf("[-] Failed to get cgroup ID: %v", err)
 	}
 	fmt.Printf("[+] Cgroup ID (inode): %s\n", cgroupID)
+
+	err = applyNftTablesRule(cgroupID, 12345)
+	if err != nil {
+		log.Fatalf("[-] Failed to apply nftables rule: %v", err)
+	}
+	fmt.Println("[+] Applied nft tables rules")
 
 	// 3. Находим PIDs по имени процесса
 	// Если процесс создает новый подпроцесс, так же находим его и передаем в cgroup
@@ -70,7 +76,7 @@ func getCgroupInode() (string, error) {
 	var stat syscall.Stat_t
 	err := syscall.Stat(cgroupPath, &stat)
 	if err != nil {
-		return "", fmt.Errorf("failed to stat cgroup path: %w", err)
+		return "", fmt.Errorf("[-] Failed to stat cgroup path: %w", err)
 	}
 	return fmt.Sprintf("%d", stat.Ino), nil
 }
@@ -141,4 +147,23 @@ func writePIDToCgroup(pid string) error {
 
 	_, err = f.WriteString(pid + "\n")
 	return err
+}
+
+// applyNftTablesRule создает nft тейбл, привязывает cgroup и перенаправляет трафик в прокси клиент (127.0.0.1)
+func applyNftTablesRule(cgroupID string, proxyPort int) error {
+	rules := []string{
+		"add table inet myproxy",
+		"add chain inet myproxy prerouting { type nat hook prerouting priority 0 ; }",
+		"add chain inet myproxy output { type route hook output priority -100 ; }",
+		fmt.Sprintf("add rule inet myproxy output socket cgroupv2 level 0 %s dnat to 127.0.0.1:%d", cgroupID, proxyPort),
+	}
+
+	for _, rule := range rules {
+		cmd := exec.Command("nft", strings.Split(rule, " ")...)
+		output, err := cmd.CombinedOutput()
+		if err != nil && !strings.Contains(string(output), "File exists") {
+			return fmt.Errorf("[-] Failed to apply rule '%s': %v\n%s", rule, err, output)
+		}
+	}
+	return nil
 }
