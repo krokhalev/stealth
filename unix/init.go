@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"github.com/sirupsen/logrus"
 	"os"
 	"os/exec"
 	"strings"
@@ -25,37 +25,27 @@ type pidsInfo struct {
 }
 
 // Init инитит cgroup и iptables
-func Init(ctx context.Context, wg *sync.WaitGroup) {
+func Init(ctx context.Context, wg *sync.WaitGroup, initDone chan struct{}, logger *logrus.Logger, errChan chan error) {
 	wg.Add(1)
-	defer func() {
-		// 0. Чистим cgroup и iptables
-		// todo: придумать нормальный путь для удаления сигруппы
-		//if err := os.RemoveAll(cgroupPath); err != nil {
-		//	log.Printf("[-] Failed to remove cgroup dir: %v", err)
-		//} else {
-		//	fmt.Println("[+] Removed cgroup directory")
-		//}
-		if err := disableRules(); err != nil {
-			log.Printf("[-] Failed to disable iptables: %v", err)
-		} else {
-			fmt.Println("[+] Disabled iptables")
-		}
-		wg.Done()
-	}()
+	defer Cleanup(wg, logger)
 
 	// 1. Создаем cgroup
 	err := createCgroup()
 	if err != nil {
-		log.Fatalf("[-] Failed to create cgroup: %v", err)
+		errChan <- fmt.Errorf("failed to create cgroup: %v", err)
+		return
 	}
-	fmt.Printf("[+] Created cgroup: %s\n", cgroupPath)
+	logger.Infof("[+] Created cgroup: %s\n", cgroupPath)
 
 	// 2. Создаем iptables
 	err = applyIptablesRules()
 	if err != nil {
-		log.Fatalf("[-] Failed to apply iptables rule: %v", err)
+		errChan <- fmt.Errorf("failed to apply iptables rule: %v", err)
+		return
 	}
-	fmt.Println("[+] Applied iptables rules")
+	logger.Info("[+] Applied iptables rules")
+
+	initDone <- struct{}{}
 
 	// 3. Находим PIDs по имени процесса
 	// Если процесс создает новый подпроцесс, так же находим его и передаем в cgroup
@@ -66,11 +56,28 @@ func Init(ctx context.Context, wg *sync.WaitGroup) {
 	}
 
 	// 4. Добавляем PIDs в cgroup
-	go addPIDToCgroup(ctx, pidsChan)
+	go addPIDToCgroup(ctx, pidsChan, logger)
 
 	// 5. Ожидаем завершения
 	<-ctx.Done()
-	fmt.Println("[!] Caught termination signal")
+	logger.Info("[!] Caught termination signal")
+}
+
+// Cleanup чистит crgoup и iptables
+func Cleanup(wg *sync.WaitGroup, logger *logrus.Logger) {
+	// 0. Чистим cgroup и iptables
+	// todo: придумать нормальный путь для удаления сигруппы
+	//if err := os.RemoveAll(cgroupPath); err != nil {
+	//	log.Printf("[-] Failed to remove cgroup dir: %v", err)
+	//} else {
+	//	fmt.Println("[+] Removed cgroup directory")
+	//}
+	if err := disableRules(); err != nil {
+		logger.Errorf("[-] Failed to disable iptables: %v", err)
+	} else {
+		logger.Info("[+] Disabled iptables")
+	}
+	wg.Done()
 }
 
 // createCgroup создает директорию cgroup
@@ -115,11 +122,11 @@ func findPIDs(ctx context.Context, processName string, pidsChan chan pidsInfo) {
 }
 
 // addPIDToCgroup добавляет PID в cgroup
-func addPIDToCgroup(ctx context.Context, pidsChan chan pidsInfo) {
+func addPIDToCgroup(ctx context.Context, pidsChan chan pidsInfo, logger *logrus.Logger) {
 	filePath := fmt.Sprintf("%s/cgroup.procs", cgroupPath)
 	f, err := os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		fmt.Printf("[-] Failed to open cgroup at %s: %v\n", filePath, err)
+		logger.Printf("[-] Failed to open cgroup at %s: %v\n", filePath, err)
 	}
 	defer f.Close()
 
@@ -135,10 +142,10 @@ func addPIDToCgroup(ctx context.Context, pidsChan chan pidsInfo) {
 				if _, exists := cache[pid]; !exists {
 					err := writePIDToCgroup(pid)
 					if err != nil {
-						fmt.Printf("[-] Failed to write PID %s: %v\n", pid, err)
+						logger.Printf("[-] Failed to write PID %s: %v\n", pid, err)
 					} else {
 						cache[pid] = struct{}{}
-						fmt.Printf("[+] Added process %s with PID %s to cgroup\n", info.processName, pid)
+						logger.Printf("[+] Added process %s with PID %s to cgroup\n", info.processName, pid)
 					}
 				}
 				mu.Unlock()
@@ -160,7 +167,7 @@ func writePIDToCgroup(pid string) error {
 	return err
 }
 
-// disableRules удаляет созданные правила iptables
+// disableRules отключает созданные правила iptables
 func disableRules() error {
 	// TCP правила
 	tcpRules := []string{
