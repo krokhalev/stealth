@@ -1,15 +1,20 @@
-tun - транспортный интерфейс для передачи пакетов  
-mtu - размер передаваемого пакета (Maximum Transmission Unit)  
+[Локальное приложение]  
+↓  
+iptables REDIRECT  
+↓  
+[Локальный прокси на 127.0.0.1:12345]  
+↓  
+[Удаленный сервер-прокси]  
+↓  
+[Целевой сервер (discord.com / youtube.com)]  
+↓  
+[Ответ обратно по цепочке]  
 
-- sudo env "PATH=$PATH" go run client.go - запустить клиент от имени администратора
-- ip link show - показать список всех интерфейсов  
-- ip route show - показать список маршрутов  
-- ip link show tun0 - показать статус интерфейса
-- ip tuntap add dev tun0 mode tun - создать tun интерфейс
-- ip addr add 10.0.0.1/24 dev tun0 - назначить ip для интерфейса
-- ip link set dev tun0 up - поднять интерфейс
-- ip route add default via 10.0.0.1 dev tun0 - назначить дефолтный роут через интерфейс
-- ip route add 0.0.0.0/1 dev tun0 - направить запросы первой половины IP-адресов в интерфейс (от 0.0.0.0 до 127.255.255.255)
-- ip route add 128.0.0.0/1 dev tun0 - направить запросы первой половины IP-адресов в интерфейс (от 128.0.0.0 до 255.255.255.255)
-- sudo tcpdump -i tun0 - проверить выходящие пакеты 
-- sudo tcpdump -i tun0 -vv (-vvv) - для подробного протокольного анализа
+sudo env "PATH=$PATH" go run unix/init.go
+watch -n 1 'cat /sys/fs/cgroup/myproxygroup/cgroup.procs'
+sudo conntrack -L -o extended | grep -E "127.0.0.1| (cat /sys/fs/cgroup/myproxygroup/cgroup.procs | tr '\n' '|')"
+
+sudo iptables -t nat -D OUTPUT -m cgroup --path myproxygroup -p tcp ! -d 127.0.0.1 --dport 80 -j DNAT --to-destination 127.0.0.1:12345
+sudo iptables -t nat -D OUTPUT -m cgroup --path myproxygroup -p tcp ! -d 127.0.0.1 --dport 443 -j DNAT --to-destination 127.0.0.1:12345
+sudo iptables -t nat -D OUTPUT -m cgroup --path myproxygroup -p udp ! -d 127.0.0.1 --dport 53 -j DNAT --to-destination 127.0.0.1:12345
+sudo iptables -t nat -L -n -v
