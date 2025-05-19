@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"strings"
 	"sync"
 	"syscall"
@@ -15,6 +14,9 @@ import (
 
 const (
 	cgroupPath = "/sys/fs/cgroup/myproxygroup"
+	cgroupName = "myproxygroup"
+	proxyIP    = "127.0.0.1"
+	proxyPort  = "12345"
 )
 
 type pidsInfo struct {
@@ -22,9 +24,24 @@ type pidsInfo struct {
 	pids        []string
 }
 
-func main() {
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
+// Init инитит cgroup и iptables
+func Init(ctx context.Context, wg *sync.WaitGroup) {
+	wg.Add(1)
+	defer func() {
+		// 0. Чистим cgroup и iptables
+		// todo: придумать нормальный путь для удаления сигруппы
+		//if err := os.RemoveAll(cgroupPath); err != nil {
+		//	log.Printf("[-] Failed to remove cgroup dir: %v", err)
+		//} else {
+		//	fmt.Println("[+] Removed cgroup directory")
+		//}
+		if err := disableRules(); err != nil {
+			log.Printf("[-] Failed to disable iptables: %v", err)
+		} else {
+			fmt.Println("[+] Disabled iptables")
+		}
+		wg.Done()
+	}()
 
 	// 1. Создаем cgroup
 	err := createCgroup()
@@ -33,33 +50,27 @@ func main() {
 	}
 	fmt.Printf("[+] Created cgroup: %s\n", cgroupPath)
 
-	// 2. Получаем cgroup inode
-	cgroupID, err := getCgroupInode()
+	// 2. Создаем iptables
+	err = applyIptablesRules()
 	if err != nil {
-		log.Fatalf("[-] Failed to get cgroup ID: %v", err)
+		log.Fatalf("[-] Failed to apply iptables rule: %v", err)
 	}
-	fmt.Printf("[+] Cgroup ID (inode): %s\n", cgroupID)
-
-	err = applyNftTablesRule(cgroupID, 12345)
-	if err != nil {
-		log.Fatalf("[-] Failed to apply nftables rule: %v", err)
-	}
-	fmt.Println("[+] Applied nft tables rules")
+	fmt.Println("[+] Applied iptables rules")
 
 	// 3. Находим PIDs по имени процесса
 	// Если процесс создает новый подпроцесс, так же находим его и передаем в cgroup
 	processNames := []string{"discord", "brave"}
 	pidsChan := make(chan pidsInfo, len(processNames))
-
 	for _, name := range processNames {
 		go findPIDs(ctx, name, pidsChan)
 	}
 
-	// 3. Добавляем PIDs в cgroup
+	// 4. Добавляем PIDs в cgroup
 	go addPIDToCgroup(ctx, pidsChan)
 
+	// 5. Ожидаем завершения
 	<-ctx.Done()
-	fmt.Printf("[!] Shutting down gracefully\n")
+	fmt.Println("[!] Caught termination signal")
 }
 
 // createCgroup создает директорию cgroup
@@ -149,20 +160,45 @@ func writePIDToCgroup(pid string) error {
 	return err
 }
 
-// applyNftTablesRule создает nft тейбл, привязывает cgroup и перенаправляет трафик в прокси клиент (127.0.0.1)
-func applyNftTablesRule(cgroupID string, proxyPort int) error {
-	rules := []string{
-		"add table inet myproxy",
-		"add chain inet myproxy prerouting { type nat hook prerouting priority 0 ; }",
-		"add chain inet myproxy output { type route hook output priority -100 ; }",
-		fmt.Sprintf("add rule inet myproxy output socket cgroupv2 level 0 %s dnat to 127.0.0.1:%d", cgroupID, proxyPort),
+// disableRules удаляет созданные правила iptables
+func disableRules() error {
+	// TCP правила
+	tcpRules := []string{
+		fmt.Sprintf("-t nat -D OUTPUT -m cgroup --path %s -p tcp ! -d %s --dport 80 -j DNAT --to-destination %s:%s", cgroupName, proxyIP, proxyIP, proxyPort),
+		fmt.Sprintf("-t nat -D OUTPUT -m cgroup --path %s -p tcp ! -d %s --dport 443 -j DNAT --to-destination %s:%s", cgroupName, proxyIP, proxyIP, proxyPort),
 	}
 
-	for _, rule := range rules {
-		cmd := exec.Command("nft", strings.Split(rule, " ")...)
-		output, err := cmd.CombinedOutput()
-		if err != nil && !strings.Contains(string(output), "File exists") {
-			return fmt.Errorf("[-] Failed to apply rule '%s': %v\n%s", rule, err, output)
+	// UDP правила
+	udpRules := []string{
+		fmt.Sprintf("-t nat -D OUTPUT -m cgroup --path %s -p udp ! -d %s --dport 53 -j DNAT --to-destination %s:%s", cgroupName, proxyIP, proxyIP, proxyPort),
+	}
+
+	for _, rule := range append(tcpRules, udpRules...) {
+		cmd := exec.Command("iptables", strings.Split(rule, " ")...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("rule '%s' failed: %v\n%s", rule, err, output)
+		}
+	}
+	return nil
+}
+
+// applyIptablesRules создает правила iptables
+func applyIptablesRules() error {
+	// TCP правила
+	tcpRules := []string{
+		fmt.Sprintf("-t nat -A OUTPUT -m cgroup --path %s -p tcp ! -d %s --dport 80 -j DNAT --to-destination %s:%s", cgroupName, proxyIP, proxyIP, proxyPort),
+		fmt.Sprintf("-t nat -A OUTPUT -m cgroup --path %s -p tcp ! -d %s --dport 443 -j DNAT --to-destination %s:%s", cgroupName, proxyIP, proxyIP, proxyPort),
+	}
+
+	// UDP правила
+	udpRules := []string{
+		fmt.Sprintf("-t nat -A OUTPUT -m cgroup --path %s -p udp ! -d %s --dport 53 -j DNAT --to-destination %s:%s", cgroupName, proxyIP, proxyIP, proxyPort),
+	}
+
+	for _, rule := range append(tcpRules, udpRules...) {
+		cmd := exec.Command("iptables", strings.Split(rule, " ")...)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("rule '%s' failed: %v\n%s", rule, err, output)
 		}
 	}
 	return nil
